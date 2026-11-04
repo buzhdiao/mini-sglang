@@ -1,9 +1,9 @@
 # Mini-SGLang 学习计划 · 题目与知识点整理
 
-> 来源：[lynnyulinlin-debug/cpp-llm-engine](https://github.com/lynnyulinlin-debug/cpp-llm-engine/issues) 的 issues（截至 2026-11-04，共 19 个，其中 15 个为学习计划类）
+> 来源：[lynnyulinlin-debug/cpp-llm-engine](https://github.com/lynnyulinlin-debug/cpp-llm-engine/issues) 的 issues（截至 2026-11-05，共 20 个，其中 15 个为学习计划类）
 > 整理规则：
 > - **保留**：各期学习计划 issue 中的核心目标、知识点、源码阅读材料、思考题与参考链接，题目原文保留，并附加「考察点 / 解题思路」注解。
-> - **排除**：明确属于「上机 / 实验 / 需要运行代码 / 需要环境」的内容——5 个打卡类 issue（#7、#8、#9、#12、#19）整体排除；各计划 issue 内的「动手任务」「打卡模板」「打卡截图要求」「GPU 环境自检」环节剔除。排除明细见附录 B。
+> - **排除**：明确属于「上机 / 实验 / 需要运行代码 / 需要环境」的内容——6 个打卡类 issue（#7、#8、#9、#12、#19、#20）整体排除；各计划 issue 内的「动手任务」「打卡模板」「打卡截图要求」「GPU 环境自检」环节剔除。排除明细见附录 B。其中 issue #20 虽为打卡帖，但正文是一篇高质量的技术作答（第二期 Task 1 思考题的参考答案），其要点已摘录为附录 C。
 
 ---
 
@@ -27,6 +27,7 @@
   - [Task 4 Overlap Scheduling 与 CPU-GPU 流水线](#第二期-task-4-overlap-scheduling-与-cpu-gpu-流水线)
 - [附录 A 第一期任务总索引（issue #13）](#附录-a-第一期任务总索引issue-13)
 - [附录 B 排除清单](#附录-b-排除清单)
+- [附录 C 学员参考答案要点（issue #20，第二期 Task 1 思考题）](#附录-c-学员参考答案要点issue-20第二期-task-1-思考题)
 
 ---
 
@@ -369,7 +370,7 @@
 
 ## 附录 B 排除清单
 
-**整体排除的 issue（上机/打卡类，共 5 个）：**
+**整体排除的 issue（上机/打卡类，共 6 个）：**
 
 | Issue | 标题 | 排除原因 |
 |---|---|---|
@@ -378,9 +379,54 @@
 | [#9](https://github.com/lynnyulinlin-debug/cpp-llm-engine/issues/9) | 打卡 | 打卡类 |
 | [#12](https://github.com/lynnyulinlin-debug/cpp-llm-engine/issues/12) | 打卡 | 打卡类 |
 | [#19](https://github.com/lynnyulinlin-debug/cpp-llm-engine/issues/19) | Task0 打卡 | 打卡类（含运行截图与环境信息） |
+| [#20](https://github.com/lynnyulinlin-debug/cpp-llm-engine/issues/20) | task1 | 打卡类（学员提交：含打卡模板头），但正文为第二期 Task 1 思考题的技术作答，要点摘录见附录 C |
 
 **各计划 issue 内剔除的环节：**
 - 所有 issue 的「打卡模板」「打卡截图要求」小节（微信群截图规范等）；
 - 各期的「动手任务」小节（安装环境、启动服务、运行脚本、截图取证等）；
 - issue #1/2/3 等打卡项中"运行截图"类子项（仅保留其中的知识性描述）；
 - issue #6 中 A4/B4/C4（GPU 环境自检/环境准备）与公共问题 3（个人环境是否满足）。
+
+<a id="附录-c-学员参考答案要点issue-20第二期-task-1-思考题"></a>
+## 附录 C 学员参考答案要点（issue #20，第二期 Task 1 思考题）
+
+> 来源：[issue #20](https://github.com/lynnyulinlin-debug/cpp-llm-engine/issues/20)（学员 lpdl 的打卡作答，题目为第二期 Task 1 思考题「KV Cache 内存布局对比笔记」）。本附录摘录其知识性要点，原文（含全部源码行号链接）见 issue。
+
+### 概念校准
+
+- 当前 Mini 版本中没有 `minisgl.kvcache.BlockAllocator`，同职责代码是 `minisgl.scheduler.cache.CacheManager`（分页分配/释放）+ `minisgl.kvcache.MHAKVCache`（物理池）+ `RadixPrefixCache`（前缀索引）。
+- 要区分两组"三层"：SGLang 的 **KV Pool / Radix Tree / ReqToTokenPool** 是职责划分（数据放哪、哪些前缀可复用、请求如何寻址）；HiCache 的 **L1 GPU HBM / L2 CPU DRAM / L3 存储后端** 是存储介质分层。二者互不等价。
+
+### Mini 侧：物理池与分配器的分工
+
+- 物理池一次创建：`_kv_buffer` 形状 `[2, L, Np, P, Hkv_local, D]`（K/V × 层数 × 页数 × 每页 token 数 × 本 rank KV heads × head_dim）；运行时 `allocate/free` 只是在取还**空闲索引**，不触发 `cudaMalloc/cudaFree`，也不需要清零旧 KV。
+- 空闲列表 `free_slots = arange(num_pages) * page_size` 保存的是**页起始 token 索引**（`12` 代表整页 `[12,15]`，不是"第 12 页"）。
+- `allocate_paged()` 只为跨页边界的增量申请新页：`new_pages = ceil(device_len/P) − ceil(cached_len/P)`；尾页未满时继续复用；一个 batch 汇总所有请求的页需求后批量分配。
+- `page_table` 是"请求行 → 物理 token 槽位"的寻址表（`[max_running_req+1, aligned_max_seq_len], int32`），名字里的"页"不等于 HiCache 的页。
+- 没有空闲页时先**驱逐**可复用缓存（Radix 树中锁计数为零的叶子）；释放有三个层次（请求结束 ≠ 立即释放：还要经过 Radix 树保留复用、引用计数清零才真正回收）。
+
+### SGLang 侧：物理存储 + 两类逻辑索引
+
+- KV Pool 只管物理存储；Radix Tree 管前缀复用关系；ReqToTokenPool 管请求寻址。两个请求共享前缀 = 树中同一节点下的物理页被多个请求的 page_table 行引用。
+
+### 从单层分页到 HiCache 的工程增量（思考题核心）
+
+- **命中 ≠ 可计算**：L2/L3 命中的数据必须先搬运回 GPU 且布局正确才可参与 attention；异步搬运引入新的资源保护条件（host 池槽位、传输通道、pin 内存配额）。
+- 命中率与延迟不总是同向：命中省去重算，但搬运可能更慢；分层命中率要结合传输带宽评估。
+- 布局对比：GPU 喜欢按层计算（attention 逐层访问），存储喜欢按页传输（顺序大块 I/O）；`layer_first` 布局每页每层 K/V 各一指针（约 2L 个片段），`page_first` 每页一个 K 片段 + 一个 V 片段（2 个片段），显著减少 scatter/gather；"整页连续"也要区分 K 与 V 是否合并。zero-copy 指 L3 直接访问已注册 Host 池地址，不表示数据不经搬运就能被 GPU 使用。
+- 页大小 P 的权衡：P 小 → 尾页碎片小、前缀复用粒度细，但页数量/元数据/I/O 调度开销大；P 大 → 传输批量、管理开销小，但尾页浪费大且不满一页的公共尾部无法复用；P 还受 attention 后端限制（如 Mini 的 TRTLLM 后端会把不支持的页大小调整为 64）。
+
+### 容量估算（标准 MHA/GQA、未量化）
+
+```text
+bytes_per_token = 2 × L × Hkv_local × D × bytes_per_element
+bytes_per_page  = P × bytes_per_token
+# 例：L=32, Hkv_local=8, D=128, BF16 → 每 token 128 KiB；P=16 → 每页 2 MiB；8192 tokens ≈ 1 GiB/rank
+```
+
+- 未计入：请求映射表（`ReqToTokenPool` 约 `4 × 行数 × 最大上下文长度` 字节）、树元数据、量化 scale、CUDA Graph 临时空间。
+- TP 按 KV heads 切分；TP 数 > KV heads 时涉及复制，不能一律"总 KV ÷ TP"。MLA（latent KV）、SWA（窗口）、混合 recurrent state 不适用上式。
+
+### 跨实例共享还需要"内容身份"
+
+- GPU slot 编号只在本实例有意义；L3 共享键必须表达"同一模型、同一上下文、同一种 KV 表示"：`KVCacheNamespace`（model_id、逻辑 dtype、page size、layer partition、head group、object layout）；Radix 匹配用 `extra_key` 隔离不同 adapter/租户。相同 token id 在不同模型/adapter 下不保证 KV 相同。
